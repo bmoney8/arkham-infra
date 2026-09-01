@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- ============================================================ -->
+  <!-- SPEC — Apple Shortcuts workflow sketch (V6.3.3 D5.6).        -->
+  <!-- NOT a buildable .shortcut binary; author it in the Shortcuts -->
+  <!-- app per ios-thin-client/README.md. Action names map to the   -->
+  <!-- Shortcuts action identifiers. NEVER embed a live token here. -->
+  <!-- ============================================================ -->
+  <key>WFWorkflowName</key>
+  <string>Arkham Meeting Ingest</string>
+  <key>WFWorkflowIcon</key>
+  <string>arkham-red</string>
+  <key>WFWorkflowInputContentItemTypes</key>
+  <array><string>WFAudioContentItem</string></array>
+  <key>WFWorkflowActions</key>
+  <array>
+    <!-- 1. Capture: mic recording (iOS has no system-audio loopback API;
+         for screen-shared calls use Record Screen/ReplayKit instead). -->
+    <dict>
+      <key>WFWorkflowActionIdentifier</key>
+      <string>is.workflow.actions.recordaudio</string>
+      <key>WFWorkflowActionParameters</key>
+      <dict>
+        <key>WFAudioRecordingDuration</key>
+        <real>3600.0</real>
+        <key>WFAudioRecordingQuality</key>
+        <string>High</string>
+      </dict>
+    </dict>
+    <!-- 2. Encode to m4a -->
+    <dict>
+      <key>WFWorkflowActionIdentifier</key>
+      <string>is.workflow.actions.encode.media</string>
+      <key>WFWorkflowActionParameters</key>
+      <dict>
+        <key>WFFormat</key>
+        <string>Audio Only (M4A)</string>
+      </dict>
+    </dict>
+    <!-- 3. Filename variable: meeting-&lt;Current Date&gt;.m4a -->
+    <dict>
+      <key>WFWorkflowActionIdentifier</key>
+      <string>is.workflow.actions.gettext</string>
+      <key>WFWorkflowActionParameters</key>
+      <dict>
+        <key>WFTextActionText</key>
+        <string>meeting-[Current Date].m4a</string>
+      </dict>
+    </dict>
+    <!-- 4. Token variable (paste at import time — see README) -->
+    <dict>
+      <key>WFWorkflowActionIdentifier</key>
+      <string>is.workflow.actions.gettext</string>
+      <key>WFWorkflowActionParameters</key>
+      <dict>
+        <key>WFTextActionText</key>
+        <string>ARIA_TOKEN_PLACEHOLDER</string>
+      </dict>
+    </dict>
+    <!-- 5. POST multipart to Genos -->
+    <dict>
+      <key>WFWorkflowActionIdentifier</key>
+      <string>is.workflow.actions.downloadurl</string>
+      <key>WFWorkflowActionParameters</key>
+      <dict>
+        <key>WFURL</key>
+        <string>http://100.64.0.5:8645/meeting/ingest</string>
+        <key>WFHTTPMethod</key>
+        <string>POST</string>
+        <key>WFHTTPRequestHeaders</key>
+        <dict>
+          <key>X-Arkham-Token</key>
+          <string>[Token Text Variable]</string>
+        </dict>
+        <key>WFHTTPBodyType</key>
+        <string>Form</string>
+        <key>WFFormValues</key>
+        <dict>
+          <key>audio</key>
+          <string>[Encoded M4A + Filename Variable]</string>
+        </dict>
+      </dict>
+    </dict>
+    <!-- 6. Speak the JSON response summary -->
+    <dict>
+      <key>WFWorkflowActionIdentifier</key>
+      <string>is.workflow.actions.gettext</string>
+      <key>WFWorkflowActionParameters</key>
+      <dict><key>WFTextActionText</key><string>[Response Data: upload_id]</string></dict>
+    </dict>
+    <dict>
+      <key>WFWorkflowActionIdentifier</key>
+      <string>is.workflow.actions.speaktext</string>
+      <key>WFWorkflowActionParameters</key>
+      <dict><key>WFSpeakTextPitch</key><real>1.0</real></dict>
+    </dict>
+  </array>
+</dict>
+</plist>

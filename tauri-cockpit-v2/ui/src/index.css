@@ -1,0 +1,14 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body {
+  background: #0b0e14;
+  color: #e6e9ef;
+  font-family:
+    "Segoe UI", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  /* iOS safe-area (mobile profile, viewport-fit=cover) */
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+}

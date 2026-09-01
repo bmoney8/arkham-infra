@@ -1,0 +1,54 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Arkham Cockpit",
+  "version": "0.1.0",
+  "identifier": "dev.arkham.cockpit",
+  "build": {
+    "beforeDevCommand": "npm run build",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Arkham Cockpit",
+        "width": 460,
+        "height": 760,
+        "minWidth": 380,
+        "minHeight": 560,
+        "resizable": true,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": true,
+        "dragDropEnabled": false,
+        "visible": true
+      },
+      {
+        "label": "twenty",
+        "title": "Twenty CRM",
+        "url": "http://100.64.0.4:3020",
+        "width": 1280,
+        "height": 840,
+        "minWidth": 720,
+        "minHeight": 520,
+        "resizable": true,
+        "decorations": false,
+        "shadow": true,
+        "dragDropEnabled": false,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": null
+    },
+    "trayIcon": {
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": false,
+      "tooltip": "Arkham Cockpit"
+    }
+  }
+}
