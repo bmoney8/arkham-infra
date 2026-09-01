@@ -1,14 +1,31 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
-type OmniState = "checking" | "ok" | "down";
+type OmniState = "checking" | "ok" | "down" | "models-unknown";
 
 async function checkOmni(): Promise<OmniState> {
+  // V6.3.4 D4.1: perform the health check through the Rust core
+  // (check_omnirt_health command) — the webview's own fetch is blocked by
+  // CORS (mesh IPs send no ACAO headers), which made the dot show
+  // "Gateway unreachable" even when the gateway was fine.
+  if (typeof (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ === "undefined") {
+    // Browser fallback (dev outside Tauri): direct fetch may still work in
+    // some environments, keep old behavior.
+    try {
+      const r = await fetch("http://100.64.0.3:8000/v1/models", {
+        headers: { Authorization: "Bearer arkham-cockpit" },
+      });
+      return r.ok ? "ok" : "down";
+    } catch {
+      return "down";
+    }
+  }
   try {
-    const r = await fetch("http://100.64.0.3:8000/v1/models", {
-      headers: { Authorization: "Bearer arkham-cockpit" },
-    });
-    return r.ok ? "ok" : "down";
+    const health = await invoke<{ ok: boolean; status_code: number; models: number; error?: string }>(
+      "check_omnirt_health",
+    );
+    if (health.ok) return health.models > 0 ? "ok" : "models-unknown";
+    return "down";
   } catch {
     return "down";
   }
@@ -63,8 +80,10 @@ export default function App() {
         </div>
         <p className="text-xs text-arkham-dim">
           {omni === "ok"
-            ? "Mesh LLM gateway reachable — 15-model catalog"
-            : omni === "down"
+            ? "Mesh LLM gateway reachable — catalog loaded"
+            : omni === "models-unknown"
+              ? "Gateway reachable — catalog parse deferred"
+              : omni === "down"
               ? "Gateway unreachable from this host"
               : "Probing mesh gateway…"}
         </p>

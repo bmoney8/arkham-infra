@@ -3,6 +3,8 @@
 // System tray with Show/Hide/Quit. Window snapping/positioning is delegated to
 // the OS (Win32 Aero Snap) plus tauri-plugin-window-state persistence.
 
+pub mod commands;
+
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
@@ -13,6 +15,9 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_shell::init())
+        .invoke_handler(tauri::generate_handler![
+            commands::check_omnirt_health
+        ])
         .setup(|app| {
             // Twenty starts hidden; the tray or cockpit UI reveals it.
             if let Some(win) = app.get_webview_window("twenty") {
