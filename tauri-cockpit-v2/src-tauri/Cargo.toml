@@ -8,11 +8,16 @@ edition = "2021"
 name = "arkham_cockpit"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+default = ["custom-protocol", "tray-icon"]
+custom-protocol = ["tauri/custom-protocol"]
+tray-icon = ["tauri/tray-icon"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2" }
 tauri-plugin-shell = "2"
 tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }

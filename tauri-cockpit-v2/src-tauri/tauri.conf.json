@@ -50,5 +50,9 @@
       "iconAsTemplate": false,
       "tooltip": "Arkham Cockpit"
     }
+  },
+  "bundle": {
+    "active": true,
+    "icon": ["icons/icon.png"]
   }
 }
