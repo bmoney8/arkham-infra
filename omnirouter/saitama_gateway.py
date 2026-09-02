@@ -248,6 +248,19 @@ async def completion(messages: List[Dict], explicit: Optional[str],
             if up.get("name") not in seen and provider_ready(up):
                 candidates.append(up); seen.add(up.get("name"))
     for up in candidates:
+        # V5.9 deprecation audit (exec 5f1206c8): OpenRouter hermes-4-405b
+        # deterministically 404s on tool-use requests ("No endpoints found that
+        # support tool use"). Skip it as a CANDIDATE when the request carries
+        # tools so agent loops go straight to a working provider (mimo/glm);
+        # it remains the LAST candidate for plain requests (tier0 failover)
+        # when no explicit model override forces it.
+        if tools and up["name"] == "hermes-4-405b":
+            # Applies to EXPLICIT 405b requests too: the OpenRouter route
+            # cannot serve tools at all, so the only way to keep the agent
+            # loop alive is a working tier0 provider. 405b still serves all
+            # plain (tools-less) requests first, explicit or tiered.
+            logger.info("skip hermes-4-405b candidate (tools present; OpenRouter route lacks tool-use endpoints)")
+            continue
         body = {"model": up["model"], "messages": messages, "stream": False}
         if tools:
             body["tools"] = tools
