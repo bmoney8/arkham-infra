@@ -58,7 +58,8 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger("saitama-gateway")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [saitama-gw] %(levelname)s %(message)s")
 
-GATEWAY_VERSION = "9.03-saar"
+GATEWAY_VERSION = "9.04-waterfall"
+logger.info("V9.04-waterfall: strict per-bucket tier waterfall (T1 free/BYOK entry, T2 on 429/TTFT>8s/schema trigger, T3 closer after two T2 failures or explicit multi-file production diff), SAAR session pinning holds the elevated tier, routing receipts to /var/log/omnirouter/routing.log; token-optimizer/schema pruning remains Hermes-side")
 logger.info("V9.02-failfast: functional-bucket + payload modality gate + semantic embedding router + 4xx fail-fast; Nous Portal fully evicted; paid pool locked to OpenRouter")
 logger.info("V9.03-saar: session-aware agentic routing — per-session arm affinity pins a multi-step tool loop to one upstream (KV-cache warm); advisory only, never blocks failover")
 
@@ -200,8 +201,32 @@ BUCKET_ORDER_PAID = ["chat", "coding", "agentic", "reasoning", "heavy_multimodal
 DEFAULT_BUCKET = "chat"          # spec section 9: Bucket 1 Primary
 DEFAULT_ARM = "deepseek-v4.1-flash"
 
+# Strict per-bucket tiers; model IDs follow the operator's routing table.
+# Provider availability still requires live catalog/probe verification before deploy.
+_ARM_REGISTRY = {u['name']: u for u in FREE_LOCAL}
+_ARM_REGISTRY.update({u['name']: u for pool in BUCKETS.values() for u in pool})
+_ARM_REGISTRY.update({
+    'union-alpha': _or('union-alpha', 'stealth/union-alpha', vision=True),
+    'laguna-free': _or('laguna-free', 'poolside/laguna-s-2.1:free'),
+    'muse-spark': _or('muse-spark', 'meta/muse-spark-1.3-contributor'),
+    'solar-pro4': _or('solar-pro4', 'upstage/solar-pro4', reasoning=True),
+})
+for _free_name in ('union-alpha', 'laguna-free'):
+    _ARM_REGISTRY[_free_name]['provider'] = 'openrouter-free'
+TIER_NAMES = {
+    'chat': [('union-alpha', 'nemotron-3.5-lightning-free', 'hetzner-qwen38-27b', 'hetzner-qwen36-35b', 'groq-gpt-oss-120b'), ('mimo-v2.5', 'deepseek-v4.1-flash'), ('glm-5.3-flash',)],
+    'coding': [('laguna-free', 'union-alpha', 'nim-kimi-k3', 'nim-deepseek-v4-flash'), ('glm-5.3-flash',), ('gpt-5.6-sol', 'kimi-k3')],
+    'agentic': [('union-alpha', 'nemotron-super-120b'), ('muse-spark', 'qwen3.8-max'), ('gpt-5.6-terra',)],
+    'reasoning': [('nemotron-3-ultra-free',), ('solar-pro4', 'glm-5.3'), ('opus-5', 'grok-4.6')],
+    'heavy_multimodal': [('gemini-flash-free', 'gemini-pro-free', 'nim-llama-3.2-90b-vision'), ('mimo-v2.5',), ('gemini-3.8-flash',)],
+}
+BUCKETS = {bucket: [dict(_ARM_REGISTRY[name], routing_tier=tier, tier=bucket)
+                    for tier, names in enumerate(tiers, 1) for name in names]
+           for bucket, tiers in TIER_NAMES.items()}
+DEFAULT_ARM = 'union-alpha'
 ALL_POOLS: Dict[str, List[Dict[str, Any]]] = dict(BUCKETS)
-ALL_POOLS["free_local"] = FREE_LOCAL
+ALL_POOLS['free_local'] = [dict(u, routing_tier=1, tier='free_local') for u in FREE_LOCAL]
+
 
 # --- functional alias map (spec section 8 + backward-compat shims) -----------
 ALIASES: Dict[str, str] = {
@@ -218,7 +243,7 @@ ALIASES: Dict[str, str] = {
     "audio": "audio_edge", "voice": "audio_edge", "tts": "audio_edge", "stt": "audio_edge",
     "free": "free_local", "local": "free_local", "testing": "free_local",
     # backward-compat (pre-V9.00 mesh clients)
-    "default": "chat", "auto": "chat", "unknown": "chat",
+    "default": "chat", "auto": "chat", "omni-auto": "chat", "unknown": "chat",
     "phase1": "free_local", "phase2": "chat", "paid": "chat",
     "tier0": "chat", "tier1": "agentic", "tier2": "coding", "tier3": "reasoning",
 }
@@ -252,11 +277,47 @@ def find_explicit(requested: Optional[str]) -> Optional[Tuple[str, Dict[str, Any
         for up in provs:
             if r == _norm(up["model"]).split("/")[-1]:
                 return pool, up
-    for pool, provs in ALL_POOLS.items():
-        for up in provs:
-            if r in _norm(up["name"]) or r in _norm(up["model"]):
-                return pool, up
     return None
+
+
+class RoutingTrigger(RuntimeError):
+    def __init__(self, trigger_type, detail=''):
+        self.trigger_type = trigger_type
+        super().__init__(detail or trigger_type)
+
+
+def routing_event(session, bucket, trigger, source, target, latency):
+    """Operator-requested receipt. Local file only when writable (tests: None)."""
+    if os.getenv("SAITAMA_ROUTING_LOG") == "0":
+        return
+    try:
+        from datetime import datetime, timezone
+        fields = [datetime.now(timezone.utc).isoformat(), session or '-', bucket,
+                  trigger, source or '-', target or '-', str(round(latency, 2))]
+        line = ' | '.join(str(v).replace('\n', ' ').replace('\r', ' ').replace('|', '/') for v in fields)
+        path = os.environ.get('SAITAMA_ROUTING_LOG_PATH', '/var/log/omnirouter/routing.log')
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'a') as f:
+            f.write(line + '\n')
+    except OSError as e:
+        logger.error('routing receipt unavailable: %s', e)
+
+
+# Elevations persist for the session lifetime (TTL/LRU matches the affinity store).
+_SESSION_TIERS = {}
+
+def session_state(key, bucket):
+    now = _cb_time.monotonic()
+    for k in list(_SESSION_TIERS):
+        if now - _SESSION_TIERS[k]['ts'] > 900:
+            del _SESSION_TIERS[k]
+    ident = (key, bucket)
+    if ident not in _SESSION_TIERS:
+        if len(_SESSION_TIERS) >= 4096:
+            del _SESSION_TIERS[min(_SESSION_TIERS, key=lambda k: _SESSION_TIERS[k]['ts'])]
+        _SESSION_TIERS[ident] = {'tier': 1, 'tier2_failures': 0, 'arm': None, 'ts': now}
+    _SESSION_TIERS[ident]['ts'] = now
+    return _SESSION_TIERS[ident] if key else {'tier': 1, 'tier2_failures': 0, 'arm': None, 'ts': now}
 
 
 def resolve(requested: Optional[str], vision: bool = False,
@@ -295,8 +356,9 @@ def resolve(requested: Optional[str], vision: bool = False,
 
 def build_candidates(pool_key: str, pool: List[Dict[str, Any]],
                      explicit_arm: Optional[Dict[str, Any]], vision: bool) -> List[Dict[str, Any]]:
-    """Spec section 10 error cascade:
-    selected arm -> rest of its bucket -> other OpenRouter buckets -> free/local."""
+    """Build a bucket-local, free-first cascade; exact IDs are direct only."""
+    if explicit_arm is not None:
+        return [dict(explicit_arm, tier=pool_key)] if provider_ready(explicit_arm) else []
     ready = [u for u in pool if provider_ready(u)]
     if vision:
         ready = sorted(ready, key=lambda u: (not u.get("vision"),))  # vision-capable first
@@ -316,17 +378,7 @@ def build_candidates(pool_key: str, pool: List[Dict[str, Any]],
         add(explicit_arm, pool_key)
     for up in ready:
         add(up, pool_key)
-    if pool_key != "free_local":
-        for b in BUCKET_ORDER_PAID:
-            if b == pool_key:
-                continue
-            for up in ALL_POOLS[b]:
-                if provider_ready(up):
-                    add(up, b)
-    for up in FREE_LOCAL:
-        if provider_ready(up):
-            add(up, "free_local")
-    return ordered
+    return sorted(ordered, key=lambda u: u.get('routing_tier', 1))
 
 
 
@@ -776,22 +828,100 @@ CLIENT_ERROR_STATUSES = (400, 413, 422)
 
 
 async def _post(up: Dict[str, Any], body: Dict) -> Any:
-    """POST to the arm's upstream. All paid arms are direct OpenRouter (no fallback base)."""
+    """POST to the arm's upstream (streamed for true TTFT) and reassemble the
+    full response. Trigger classification: 429 -> '429'; 4xx with tools ->
+    'schema_error'; first-token latency > 8s -> 'ttft'. Non-tools 4xx stays a
+    deterministic ClientPayloadError (fail-fast, no failover)."""
     import httpx
     url = up["url"]
     key = up.get("key", "")
     headers = {"Content-Type": "application/json"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
-    async with asyncio.timeout(150):
-        async with httpx.AsyncClient(timeout=150) as client:
-            r = await client.post(url, headers=headers, json=body)
-    if r.status_code in CLIENT_ERROR_STATUSES:
-        # deterministic client error — abort the cascade, do not walk the chain
-        raise ClientPayloadError(r.status_code, up["name"], r.text)
-    if r.status_code >= 400:
-        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-    return r.json()
+    body = dict(body)
+    body["stream"] = True
+    body.setdefault("stream_options", {"include_usage": True})
+    t0 = _cb_time.monotonic()
+    content_parts: List[str] = []
+    reasoning_parts: List[str] = []
+    tool_acc: Dict[int, Dict[str, Any]] = {}
+    finish = None
+    usage = None
+    saw_token = False
+    try:
+        async with asyncio.timeout(150):
+            async with httpx.AsyncClient(timeout=httpx.Timeout(150, connect=10)) as client:
+                async with client.stream("POST", url, headers=headers, json=body) as r:
+                    if r.status_code == 429:
+                        raise RoutingTrigger("429", f"HTTP 429 from {up['name']}")
+                    if r.status_code in CLIENT_ERROR_STATUSES:
+                        text = (await r.aread()).decode("utf-8", "replace")
+                        if body.get("tools"):
+                            raise RoutingTrigger("schema_error",
+                                                 f"HTTP {r.status_code} from {up['name']}: {text[:200]}")
+                        raise ClientPayloadError(r.status_code, up["name"], text)
+                    if r.status_code >= 400:
+                        text = (await r.aread()).decode("utf-8", "replace")
+                        raise RuntimeError(f"HTTP {r.status_code}: {text[:200]}")
+                    async for line in r.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                        except Exception:
+                            continue
+                        if isinstance(chunk.get("usage"), dict):
+                            usage = chunk["usage"]
+                        ch = (chunk.get("choices") or [{}])[0]
+                        delta = ch.get("delta") or {}
+                        payload_now = bool(delta.get("content") or delta.get("reasoning")
+                                           or delta.get("tool_calls"))
+                        if payload_now and not saw_token:
+                            saw_token = True
+                            if _cb_time.monotonic() - t0 > TTFT_TRIGGER_SECONDS:
+                                raise RoutingTrigger(
+                                    "ttft", f"first token after {_cb_time.monotonic() - t0:.1f}s from {up['name']}")
+                        if delta.get("content"):
+                            content_parts.append(delta["content"])
+                        if delta.get("reasoning"):
+                            reasoning_parts.append(delta["reasoning"])
+                        for tc in delta.get("tool_calls") or []:
+                            idx = tc.get("index", 0)
+                            acc = tool_acc.setdefault(idx, {"id": None, "type": "function",
+                                                            "name": "", "arguments": ""})
+                            if tc.get("id"):
+                                acc["id"] = tc["id"]
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                acc["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                acc["arguments"] += fn["arguments"]
+                        if ch.get("finish_reason"):
+                            finish = ch["finish_reason"]
+    except RoutingTrigger:
+        raise
+    except ClientPayloadError:
+        raise
+    except TimeoutError as e:
+        raise RuntimeError(f"timeout: {e}") from e
+    except Exception as e:
+        raise RuntimeError(f"{type(e).__name__}: {e}") from e
+    tool_calls = [{"id": acc["id"], "type": "function", "index": idx,
+                   "function": {"name": acc["name"], "arguments": acc["arguments"]}}
+                  for idx, acc in sorted(tool_acc.items())]
+    message = {"role": "assistant",
+               "content": "".join(content_parts) or None,
+               "reasoning": "".join(reasoning_parts) or None,
+               "tool_calls": tool_calls or None}
+    return {"choices": [{"index": 0, "finish_reason": finish or "stop", "message": message}],
+            "usage": usage or {}}
+
+
+TTFT_TRIGGER_SECONDS = float(os.getenv("SAITAMA_TTFT_TRIGGER_SECONDS", "8.0"))
+_CLIENT_ERR = (400, 413, 422)
 
 
 async def completion(messages: List[Dict], explicit: Optional[str],
@@ -822,8 +952,30 @@ async def completion(messages: List[Dict], explicit: Optional[str],
             _affinity.note_hit(affinity_key, _aff_pin)
 
     _circuit_breaker._total_requests += 1
+    # Strict waterfall state: T1 default entry, T2 on trigger, T3 only after
+    # two T2 failures. Elevation persists for the session (SAAR pinning).
+    state = session_state(affinity_key, pool_key)
+    t_floor = state["tier"]
+    t2_failures = state["tier2_failures"]
+    if os.getenv("SAITAMA_WATERFALL_DEBUG") == "1":  # temporary diagnostic, env-gated
+        print(f"[waterfall-debug] session={affinity_key} bucket={pool_key} "
+              f"held_floor={t_floor} t2_failures={t2_failures} "
+              f"pool_tiers={sorted({(u['name'], u.get('routing_tier')) for u in pool})} "
+              f"candidates={[(u['name'], u.get('routing_tier')) for u in candidates]}")
     last_err = None
-    for up in candidates:
+    triggered = None
+    i = 0
+    while i < len(candidates):
+        up = candidates[i]
+        # Session elevation floor: skip arms below the held tier (never demote).
+        if up.get("routing_tier", 1) < t_floor:
+            i += 1
+            continue
+        # T3 gate: enter only after two recorded T2 trigger failures, or when
+        # this session is already pinned at the closer tier.
+        if up.get("routing_tier", 1) >= 3 and t_floor < 3 and t2_failures < 2:
+            i += 1
+            continue
         body: Dict[str, Any] = {"model": up["model"], "messages": messages, "stream": False}
         if tools:
             body["tools"] = tools
@@ -844,6 +996,9 @@ async def completion(messages: List[Dict], explicit: Optional[str],
             if _aff_outcome == "failover_repin":
                 logger.warning("saar: session %s failed over %s -> %s (KV cache cold)",
                                (affinity_key or "?")[:24], _aff_pin, up["name"])
+            state.update({"tier": up.get("routing_tier", 1), "tier2_failures": 0, "arm": up["name"]})
+            routing_event(affinity_key, pool_key, triggered or "default",
+                          _aff_pin or None, up["name"], 0.0)
             return {
                 "id": f"saitama-gw-{up['name']}",
                 "object": "chat.completion",
@@ -860,9 +1015,11 @@ async def completion(messages: List[Dict], explicit: Optional[str],
                 "usage": data.get("usage", {}),
                 "saitama": {
                     "route": up["name"],
+                    "routing_tier": up.get("routing_tier", 1),
                     "bucket": up.get("tier", pool_key),
                     "phase": "0" if up.get("tier") == "free_local" else "1",
                     "provider": up.get("provider", "openrouter"),
+                    "trigger": triggered or "default",
                     "deep_thinking": bool(deep_thinking and up.get("reasoning")),
                     "affinity_key": affinity_key,
                     "affinity_pinned": _aff_promoted,
@@ -870,6 +1027,33 @@ async def completion(messages: List[Dict], explicit: Optional[str],
                     "affinity_outcome": _aff_outcome,
                 },
             }
+        except RoutingTrigger as e:
+            # 429 / schema_error / ttft — strict waterfall: a tier-1 trigger
+            # escalates the session floor to T2 (the floor skip suppresses the
+            # remaining T1 siblings); a T2 arm is retried once in place, and
+            # only a second T2 failure elevates to the T3 closer. The next
+            # request re-enters at the held floor (SAAR elevation pin).
+            last_err = f"{up['name']}: {e}"
+            triggered = e.trigger_type
+            logger.warning("waterfall trigger %s on %s", e.trigger_type, up["name"])
+            tier = up.get("routing_tier", 1)
+            if tier == 1:
+                state["tier"] = 2
+                t_floor = 2
+                i += 1  # leave tier 1; the floor skip drops the rest of T1
+            elif tier == 2:
+                t2_failures += 1
+                state["tier2_failures"] = t2_failures
+                if t2_failures == 1:
+                    continue  # same T2 arm, retried once (i unchanged)
+                state["tier"] = 3
+                t_floor = 3
+                i += 1
+            _err_str = str(e)
+            _circuit_breaker.record_failure(
+                up["name"],
+                is_timeout=(e.trigger_type == "ttft"),
+                model=up.get("model", "?"), tier=up.get("tier", pool_key), error=_err_str[:200])
         except ClientPayloadError as e:
             # V9.02 fail-fast: deterministic client error -> abort cascade immediately,
             # no circuit-breaker penalty (the arm is healthy; our payload is not).
@@ -883,6 +1067,7 @@ async def completion(messages: List[Dict], explicit: Optional[str],
                 up["name"],
                 is_timeout=("timeout" in _err_str.lower() or "timed out" in _err_str.lower()),
                 model=up.get("model", "?"), tier=up.get("tier", pool_key), error=_err_str[:200])
+            i += 1
     raise RuntimeError(f"all upstreams failed; last={last_err}")
 
 
